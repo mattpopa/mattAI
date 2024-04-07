@@ -1,3 +1,6 @@
+import os
+import time
+from threading import Thread
 import re
 import requests
 from dotenv import load_dotenv
@@ -104,14 +107,13 @@ def fetch_notion_page_text(page_id):
 
 
 def query_openai_for_image(image_url, user_query):
-  # Refactored function to correctly handle image analysis with GPT-4 Vision model
   response = openai.ChatCompletion.create(
       model="gpt-4-vision-preview",
       messages=[
         {"role": "user", "content": user_query},
         {"role": "system", "content": [{"type": "image_url", "image_url": image_url}]}
       ],
-      #max_tokens=3000
+      max_tokens=4000
   )
   return response.choices[0]['message']['content']
 
@@ -119,12 +121,12 @@ def query_openai_for_image(image_url, user_query):
 def query_openai_for_text(text_content, user_query):
   # Function to analyze text content with GPT-3.5 Turbo model
   response = openai.ChatCompletion.create(
-      model="gpt-3.5-turbo-0125",
+      model="gpt-4-turbo-preview",
       messages=[
         {"role": "user", "content": user_query},
         {"role": "system", "content": text_content}
       ],
-      #max_tokens=3000
+      max_tokens=4000
   )
   return response.choices[0]['message']['content']
 
@@ -132,24 +134,58 @@ def query_openai_for_text(text_content, user_query):
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 
 
+def synthesize_response(text_analysis, image_analysis, user_query):
+  # Use the analyses as context for a new query to generate a single, concise response
+  context = f"Text Analysis: {text_analysis}\nImage Analysis: {image_analysis}"
+  prompt = f"Given the analyses, {user_query}"
+  response = openai.ChatCompletion.create(
+      model="gpt-3.5-turbo-0125",
+      messages=[
+        {"role": "system", "content": context},
+        {"role": "user", "content": prompt}
+      ],
+      max_tokens=150
+  )
+  return response.choices[0]['message']['content']
+
+# Update the message_handler to include the synthesis step
 @app.message(re.compile(".*"))
 def message_handler(client, message, say):
-  # Combined message handler to analyze both text and image content
   channel_id = message['channel']
   thread_ts = message['ts']
   user_query = message['text']
 
-  ts = say(text="Analyzing your request... :mag_right:", channel=channel_id, thread_ts=thread_ts)['ts']
+  ts = say(text="one moment, please... :eyes:", channel=channel_id, thread_ts=thread_ts)['ts']
 
   text_content = fetch_notion_page_text(notion_page_id)
   image_urls = fetch_notion_page_images(notion_page_id)
 
-  text_analysis = query_openai_for_text(text_content, user_query)
-  image_analysis = "No image content found." if not image_urls else query_openai_for_image(image_urls[0], user_query)
+  # Perform text and image analyses
+  text_analysis = query_openai_for_text(text_content, user_query) if text_content else "No text content found."
+  image_analysis = query_openai_for_image(image_urls[0], user_query) if image_urls else "No image content found."
 
-  combined_analysis = f"Text Analysis: {text_analysis}\nImage Analysis: {image_analysis}"
-  client.chat_update(channel=channel_id, ts=ts, text=combined_analysis, thread_ts=thread_ts)
+  # Synthesize a single, concise response from both analyses
+  if text_analysis or image_analysis:
+    final_response = synthesize_response(text_analysis, image_analysis, user_query)
+  else:
+    final_response = "I couldn't find any relevant information."
 
+  # Update the initial message with the final, synthesized response
+  client.chat_update(channel=channel_id, ts=ts, text=final_response, thread_ts=thread_ts)
+
+
+def health_check_worker():
+  while True:
+    try:
+      # Touch a file to indicate health
+      with open("/tmp/healthz", "w") as f:
+        f.write("ok")
+    except Exception as e:
+      print(f"Health check failed: {e}")
+    # Sleep for a specified interval (e.g., 30 seconds)
+    time.sleep(30)
 
 if __name__ == "__main__":
+  # Start the health check worker in a separate thread
+  Thread(target=health_check_worker, daemon=True).start()
   SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN")).start()
